@@ -1,0 +1,176 @@
+name: Build Windows x64 Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      osrm_version:
+        description: "OSRM version to build (e.g. v6.0.0). Leave empty to use the current ref."
+        required: false
+        type: string
+      upload_release:
+        description: "Upload artifacts to GitHub Release"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-win-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  VCPKG_COMMIT_ID: d015e31e90838a4c9dfa3eed45979bc70d9357fc
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-bincache
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-bincache,readwrite"
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.osrm_version || github.ref }}
+          fetch-depth: 0
+
+      - name: Move temp directory to D drive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path 'D:\Temp' -Force | Out-Null
+          'TMP=D:\Temp' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'TEMP=D:\Temp' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Enable vcpkg binary cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-md-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay-ports/**') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-md-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          vcpkgJsonGlob: "vcpkg.json"
+
+      - name: Prepare environment
+        shell: bash
+        run: |
+          # lukka/run-vcpkg sets VCPKG_ROOT with native backslashes on Windows.
+          # bash eats those as escapes during $VAR expansion, mangling paths.
+          # Rewrite with forward slashes — CMake accepts both on Windows.
+          echo "VCPKG_ROOT=${VCPKG_ROOT//\\//}" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake --preset ci-windows
+
+      - name: Build OSRM
+        id: build
+        shell: bash
+        run: |
+          cmake --build --preset ci-windows --config Release
+
+      - name: Install OSRM binaries
+        shell: bash
+        run: |
+          mkdir -p install/bin
+          cmake --install build --prefix install --config Release
+
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          $installDir = "${{ github.workspace }}\install\bin"
+          $vcpkgInstalled = "${{ github.workspace }}\build\vcpkg_installed\x64-windows-static-md\bin"
+
+          # With static-md triplet, most libs are static.
+          # TBB is always shared (tbb12.dll) — vcpkg's port forces it.
+          # Copy any DLLs from vcpkg_installed that the executables depend on.
+          if (Test-Path $vcpkgInstalled) {
+            Write-Host "Copying DLLs from vcpkg_installed..."
+            Get-ChildItem -Path $vcpkgInstalled -Filter "*.dll" | ForEach-Object {
+              Copy-Item $_.FullName -Destination $installDir -Force
+              Write-Host "  Copied: $($_.Name)"
+            }
+          }
+
+          # Also check the build output directory for any DLLs
+          $buildBin = "${{ github.workspace }}\build\Release"
+          if (Test-Path $buildBin) {
+            Get-ChildItem -Path $buildBin -Filter "*.dll" | ForEach-Object {
+              if (-not (Test-Path (Join-Path $installDir $_.Name))) {
+                Copy-Item $_.FullName -Destination $installDir -Force
+                Write-Host "  Copied from build: $($_.Name)"
+              }
+            }
+          }
+
+      - name: Copy profiles
+        shell: bash
+        run: |
+          mkdir -p install/share/osrm
+          cp -r profiles install/share/osrm/
+          cp -r data install/share/osrm/ 2>/dev/null || true
+
+      - name: List package contents
+        shell: pwsh
+        run: |
+          Write-Host "=== Package contents ==="
+          Get-ChildItem -Path "${{ github.workspace }}\install" -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Determine version string
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.osrm_version }}" ]; then
+            # Explicit version input (workflow_dispatch)
+            VERSION="${{ inputs.osrm_version }}"
+            # Strip leading 'v' if present
+            VERSION="${VERSION#v}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # Tag push: extract version from the tag
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # Branch push or workflow_dispatch without version: read from package.json
+            VERSION=$(node -e "console.log(require('./package.json').version)")
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive
+        id: archive
+        shell: bash
+        run: |
+          cd install
+          ARCHIVE_NAME="osrm-backend-windows-x64-${{ steps.version.outputs.version }}.zip"
+          7z a -tzip "../${ARCHIVE_NAME}" .
+          echo "archive=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          cd ..
+
+      - name: Upload archive as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: osrm-backend-windows-x64-${{ steps.version.outputs.version }}
+          path: ${{ steps.archive.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: ${{ inputs.upload_release == true || github.event_name == 'push' }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.tag }}
+          name: OSRM ${{ steps.version.outputs.version }} — Windows x64
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          artifacts: ${{ steps.archive.outputs.archive }}
+          omitBody: true
+          omitBodyDuringUpdate: true
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
